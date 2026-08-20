@@ -1,0 +1,72 @@
+name: Vemoria Exact PostgreSQL 16 Gate
+
+on:
+  push:
+    branches:
+      - pre-mb16-pg16-gate
+  workflow_dispatch:
+
+jobs:
+  exact-pg16:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify runner SHA256
+        run: |
+          EXPECTED="$(awk '{print $1}' VEMORIA_PRE_MB16_EXACT_PG16_RUNNER_R2_2026-08-20.zip.sha256)"
+          ACTUAL="$(sha256sum VEMORIA_PRE_MB16_EXACT_PG16_RUNNER_R2_2026-08-20.zip | awk '{print $1}')"
+          echo "expected=$EXPECTED"
+          echo "actual=$ACTUAL"
+          test "$EXPECTED" = "$ACTUAL"
+
+      - name: Extract runner
+        run: |
+          unzip -q VEMORIA_PRE_MB16_EXACT_PG16_RUNNER_R2_2026-08-20.zip
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: VEMORIA_PRE_MB16_EXACT_PG16_RUNNER_R2_2026-08-20
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-gate.txt
+
+      - name: Run exact PostgreSQL 16 gate
+        working-directory: VEMORIA_PRE_MB16_EXACT_PG16_RUNNER_R2_2026-08-20
+        env:
+          PGPASSWORD: postgres
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+        run: |
+          bash scripts/run_exact_pg16_gate.sh
+
+      - name: Upload proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vemoria-pre-mb16-exact-pg16-proof
+          path: VEMORIA_PRE_MB16_EXACT_PG16_RUNNER_R2_2026-08-20/evidence/
+          if-no-files-found: error
