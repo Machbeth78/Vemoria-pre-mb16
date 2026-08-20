@@ -1,0 +1,117 @@
+name: Vemoria Exact PostgreSQL 16 Gate R3
+
+on:
+  push:
+    branches:
+      - pre-mb16-pg16-gate
+  workflow_dispatch:
+
+jobs:
+  exact-pg16-r3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify runner SHA256
+        run: |
+          EXPECTED="$(awk '{print $1}' VEMORIA_PRE_MB16_EXACT_PG16_RUNNER_R2_2026-08-20.zip.sha256)"
+          ACTUAL="$(sha256sum VEMORIA_PRE_MB16_EXACT_PG16_RUNNER_R2_2026-08-20.zip | awk '{print $1}')"
+          echo "expected=$EXPECTED"
+          echo "actual=$ACTUAL"
+          test "$EXPECTED" = "$ACTUAL"
+
+      - name: Extract runner
+        run: |
+          unzip -q VEMORIA_PRE_MB16_EXACT_PG16_RUNNER_R2_2026-08-20.zip
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: VEMORIA_PRE_MB16_EXACT_PG16_RUNNER_R2_2026-08-20
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-gate.txt
+
+      - name: Prepare historical test_app fixture
+        env:
+          PGPASSWORD: postgres
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+        run: |
+          psql -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'test_app') THEN
+              CREATE ROLE test_app NOLOGIN NOSUPERUSER NOBYPASSRLS;
+            END IF;
+          END
+          $$;
+          SQL
+          psql -d postgres -v ON_ERROR_STOP=1 -c 'DROP DATABASE IF EXISTS test_app_anchor WITH (FORCE);'
+          psql -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE test_app_anchor OWNER test_app;'
+
+      - name: Patch isolated harness and validate shell
+        working-directory: VEMORIA_PRE_MB16_EXACT_PG16_RUNNER_R2_2026-08-20
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/run_exact_pg16_gate.sh')
+          s = p.read_text(encoding='utf-8')
+
+          needle = '''PYTHONPATH=backend VEMORA_DATABASE_URL="$VEMORA_DATABASE_URL" python3 backend/tools/migration_runner.py status\n\n# v296 runtime closure'''
+          replacement = '''PYTHONPATH=backend VEMORA_DATABASE_URL="$VEMORA_DATABASE_URL" python3 backend/tools/migration_runner.py status\n\n# Exact-PG16 harness cleanup: test_app is historical test-only state, not production state.\npsql -v ON_ERROR_STOP=1 -d postgres -c 'DROP DATABASE IF EXISTS test_app_anchor WITH (FORCE);'\npsql -v ON_ERROR_STOP=1 -d vemoria_test_db <<'SQL'\nDO $$\nBEGIN\n  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'test_app') THEN\n    EXECUTE 'DROP OWNED BY test_app';\n    EXECUTE 'DROP ROLE test_app';\n  END IF;\nEND\n$$;\nSQL\n\n# v296 runtime closure'''
+          if needle not in s:
+              raise SystemExit('FAIL: runner cleanup insertion point not found')
+          s = s.replace(needle, replacement, 1)
+
+          bad_v296 = '''V296COUNT="$(psql -d vemoria_test_db -Atc \\\"SELECT count(*) FROM public.schema_migration_state WHERE migration_name='migration_v296_generic_interest_watch.sql';\\\")"'''
+          good_v296 = '''V296COUNT="$(psql -d vemoria_test_db -Atc "SELECT count(*) FROM public.schema_migration_state WHERE migration_name='migration_v296_generic_interest_watch.sql';")"'''
+          bad_helpers = '''HELPERS="$(psql -d vemoria_test_db -Atc \\\"SELECT (to_regprocedure('public.mb13_p0_validate_target_pre296(uuid,text,jsonb,boolean)') IS NULL AND to_regprocedure('public.mb13_p0_lock_and_verify_consents_pre296(uuid,jsonb,text,jsonb,boolean,boolean)') IS NULL)::int;\\\")"'''
+          good_helpers = '''HELPERS="$(psql -d vemoria_test_db -Atc "SELECT (to_regprocedure('public.mb13_p0_validate_target_pre296(uuid,text,jsonb,boolean)') IS NULL AND to_regprocedure('public.mb13_p0_lock_and_verify_consents_pre296(uuid,jsonb,text,jsonb,boolean,boolean)') IS NULL)::int;")"'''
+
+          if bad_v296 not in s or bad_helpers not in s:
+              raise SystemExit('FAIL: final evidence quoting patch targets not found')
+          s = s.replace(bad_v296, good_v296, 1).replace(bad_helpers, good_helpers, 1)
+          p.write_text(s, encoding='utf-8')
+          PY
+          bash -n scripts/run_exact_pg16_gate.sh
+
+      - name: Run exact PostgreSQL 16 gate R3
+        working-directory: VEMORIA_PRE_MB16_EXACT_PG16_RUNNER_R2_2026-08-20
+        env:
+          PGPASSWORD: postgres
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+        run: |
+          bash scripts/run_exact_pg16_gate.sh
+
+      - name: Upload proof R3
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vemoria-pre-mb16-exact-pg16-proof-r3
+          path: VEMORIA_PRE_MB16_EXACT_PG16_RUNNER_R2_2026-08-20/evidence/
+          if-no-files-found: error
